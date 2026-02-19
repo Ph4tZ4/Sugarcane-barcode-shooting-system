@@ -1,14 +1,12 @@
 // ================= ตั้งค่าส่วนกลาง (Global Config) =================
 var DATA_START_ROW = 3; // ข้อมูลเริ่มที่แถว 3
 var HEADER_ROWS = 2;    // จำนวนแถวหัวตาราง
-var DB_MAX_COLS = 14;   // [OPTIMIZED] ดึงเฉพาะ Col A-N (14 คอลัมน์) ที่ใช้จริง
+var DB_MAX_COLS = 14;   // ดึงเฉพาะ Col A-N (14 คอลัมน์) ที่ใช้จริง
+var INDEX_SHEET_NAME = "BillIndex"; // ชีท index สำหรับ binary search
+var INDEX_CHUNK_SIZE = 10000; // จำนวน entries ต่อ 1 chunk ใน boundary cache
 
 // ================= Cache Helpers =================
 
-/**
- * [OPTIMIZED] ใช้ CacheService เก็บค่า lastRow + record data + station mapping
- * ลด API calls ไปยัง Google Sheets server อย่างมาก
- */
 function getCachedLastRow(sheet) {
     if (!sheet) return 0;
     var cache = CacheService.getScriptCache();
@@ -27,9 +25,8 @@ function invalidateLastRowCache(sheetName) {
 }
 
 /**
- * [NEW] Cache ข้อมูล record ของ bill ที่เคยค้นหาแล้ว
+ * Cache ข้อมูล record ของ bill ที่เคยค้นหาแล้ว
  * ยิงบาร์โค้ดซ้ำ / ค้นหา bill เดิม → ดึงจาก cache ทันที (< 100ms)
- * TTL = 300 วินาที (5 นาที)
  */
 function getCachedRecord(billNumber) {
     var cache = CacheService.getScriptCache();
@@ -47,7 +44,196 @@ function setCachedRecord(billNumber, recordArray) {
     } catch (e) { /* ignore cache write errors */ }
 }
 
-// ================= 1. onEdit Trigger (Optimized) =================
+// =================================================================================
+// ================= INDEX SHEET + BINARY SEARCH SYSTEM (v3) =======================
+// =================================================================================
+
+/**
+ * สร้าง/rebuild ชีท "BillIndex" จาก DataBase
+ * ดึง Bill Number (Col C) + Row Number → sort → เขียนลง BillIndex
+ * 
+ * ⚠️ ตั้ง Time-driven Trigger ให้รันทุก 10 นาที:
+ *    Apps Script Editor → Triggers → Add Trigger → rebuildBillIndex → Time-driven → Every 10 minutes
+ */
+function rebuildBillIndex() {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var dbSheet = ss.getSheetByName("DataBase");
+    if (!dbSheet) return;
+
+    var lastDbRow = dbSheet.getLastRow();
+    if (lastDbRow < HEADER_ROWS + 1) return;
+
+    // ================= Phase 1: ดึง Bill Numbers + Row Numbers =================
+    var CHUNK_SIZE = 50000;
+    var indexData = []; // [[bill, rowNumber], ...]
+
+    for (var start = HEADER_ROWS + 1; start <= lastDbRow; start += CHUNK_SIZE) {
+        var numRows = Math.min(CHUNK_SIZE, lastDbRow - start + 1);
+        var bills = dbSheet.getRange(start, 3, numRows, 1).getValues(); // Col C only
+
+        for (var d = 0; d < bills.length; d++) {
+            var bill = bills[d][0];
+            if (bill && bill.toString().trim() !== "") {
+                indexData.push([bill.toString().trim(), start + d]);
+            }
+        }
+    }
+
+    if (indexData.length === 0) return;
+
+    // ================= Phase 2: Sort ตาม Bill Number =================
+    indexData.sort(function (a, b) {
+        var billA = a[0].toString();
+        var billB = b[0].toString();
+        if (billA < billB) return -1;
+        if (billA > billB) return 1;
+        return 0;
+    });
+
+    // ================= Phase 3: เขียนลง BillIndex Sheet =================
+    var indexSheet = ss.getSheetByName(INDEX_SHEET_NAME);
+    if (!indexSheet) {
+        indexSheet = ss.insertSheet(INDEX_SHEET_NAME);
+    } else {
+        indexSheet.clearContents();
+    }
+
+    // Header
+    indexSheet.getRange(1, 1, 1, 2).setValues([["BillNumber", "RowInDB"]]);
+
+    // เขียนข้อมูลเป็น chunk เพื่อหลีกเลี่ยง timeout
+    var WRITE_CHUNK = 50000;
+    for (var w = 0; w < indexData.length; w += WRITE_CHUNK) {
+        var chunk = indexData.slice(w, Math.min(w + WRITE_CHUNK, indexData.length));
+        indexSheet.getRange(w + 2, 1, chunk.length, 2).setValues(chunk);
+    }
+
+    // ================= Phase 4: Cache Boundary List =================
+    cacheBoundaries(indexData);
+
+    // ซ่อน sheet ไม่ให้ user เห็น (optional)
+    indexSheet.hideSheet();
+
+    Logger.log("✅ BillIndex rebuilt: " + indexData.length + " entries");
+}
+
+/**
+ * Cache ทุก INDEX_CHUNK_SIZE entries จาก sorted index เป็น "boundaries"
+ * ใช้สำหรับ binary search หา chunk range
+ */
+function cacheBoundaries(indexData) {
+    var cache = CacheService.getScriptCache();
+    var boundaries = [];
+
+    // เก็บ entry ทุก INDEX_CHUNK_SIZE entries
+    for (var i = 0; i < indexData.length; i += INDEX_CHUNK_SIZE) {
+        boundaries.push(indexData[i][0]); // bill number ตัวแรกของแต่ละ chunk
+    }
+
+    // Cache boundaries เป็น JSON (70 entries × ~20 bytes = ~1.4KB → สบาย)
+    cache.put('idx_boundaries', JSON.stringify(boundaries), 900); // 15 นาที
+    cache.put('idx_total', indexData.length.toString(), 900);
+
+    Logger.log("Cached " + boundaries.length + " boundaries");
+}
+
+/**
+ * ค้นหา record จาก BillIndex ด้วย Binary Search
+ * 1. ดึง boundaries จาก cache → หา chunk ที่ต้องอ่าน
+ * 2. อ่าน chunk ~10K entries จาก BillIndex
+ * 3. Binary search ใน chunk → ได้ row number ใน DataBase
+ * 4. ดึง 1 แถวจาก DataBase
+ */
+function findRecordByIndex(ss, dbSheet, billNumber) {
+    var cache = CacheService.getScriptCache();
+    var billTrimmed = billNumber.toString().trim();
+
+    // ================= Step 1: ดึง boundaries จาก cache =================
+    var boundariesJson = cache.get('idx_boundaries');
+    var totalStr = cache.get('idx_total');
+
+    if (!boundariesJson || !totalStr) {
+        // ไม่มี index → fallback ไปใช้ TextFinder
+        return findRecordInBigData(dbSheet, billTrimmed, 3);
+    }
+
+    var boundaries = JSON.parse(boundariesJson);
+    var totalEntries = parseInt(totalStr);
+
+    // ================= Step 2: Binary search ใน boundaries =================
+    // หา chunk index ที่ bill number อยู่
+    var chunkIndex = binarySearchBoundary(boundaries, billTrimmed);
+
+    // ================= Step 3: โหลด chunk จาก BillIndex sheet =================
+    var indexSheet = ss.getSheetByName(INDEX_SHEET_NAME);
+    if (!indexSheet) {
+        return findRecordInBigData(dbSheet, billTrimmed, 3);
+    }
+
+    // คำนวณ range ของ chunk ที่ต้องอ่าน (row ใน BillIndex sheet, +2 เพราะ row 1 = header)
+    var chunkStartRow = chunkIndex * INDEX_CHUNK_SIZE + 2; // +2: header อยู่ row 1, data เริ่ม row 2
+    var chunkEndRow = Math.min(chunkStartRow + INDEX_CHUNK_SIZE - 1, totalEntries + 1);
+    var chunkNumRows = chunkEndRow - chunkStartRow + 1;
+
+    if (chunkNumRows <= 0) {
+        return findRecordInBigData(dbSheet, billTrimmed, 3);
+    }
+
+    var chunkData = indexSheet.getRange(chunkStartRow, 1, chunkNumRows, 2).getValues();
+
+    // ================= Step 4: Binary search ใน chunk =================
+    var dbRowNumber = binarySearchInChunk(chunkData, billTrimmed);
+
+    if (dbRowNumber === -1) {
+        // ไม่เจอใน chunk → fallback ลองเช็ค chunk ข้าง ๆ หรือ TextFinder
+        return findRecordInBigData(dbSheet, billTrimmed, 3);
+    }
+
+    // ================= Step 5: ดึง record จาก DataBase =================
+    return dbSheet.getRange(dbRowNumber, 1, 1, DB_MAX_COLS).getValues()[0];
+}
+
+/**
+ * Binary search ใน boundary list → return chunk index ที่ bill อาจอยู่
+ */
+function binarySearchBoundary(boundaries, target) {
+    var low = 0;
+    var high = boundaries.length - 1;
+
+    while (low <= high) {
+        var mid = Math.floor((low + high) / 2);
+        var cmp = boundaries[mid].toString();
+
+        if (cmp === target) return mid;
+        if (cmp < target) low = mid + 1;
+        else high = mid - 1;
+    }
+
+    // target อยู่ระหว่าง boundaries → return chunk ก่อนหน้า
+    return Math.max(0, low - 1);
+}
+
+/**
+ * Binary search ใน chunk data [[bill, rowNumber], ...] → return row number ใน DB
+ * Return -1 ถ้าไม่เจอ
+ */
+function binarySearchInChunk(chunkData, target) {
+    var low = 0;
+    var high = chunkData.length - 1;
+
+    while (low <= high) {
+        var mid = Math.floor((low + high) / 2);
+        var bill = chunkData[mid][0].toString().trim();
+
+        if (bill === target) return chunkData[mid][1]; // row number in DB
+        if (bill < target) low = mid + 1;
+        else high = mid - 1;
+    }
+
+    return -1; // not found
+}
+
+// ================= 1. onEdit Trigger (Optimized v3 — Index + Binary Search) =================
 function onEdit(e) {
     // ================= ตั้งค่าระบบ =================
     var factorySheetName = "รวมโรงงาน";
@@ -71,7 +257,7 @@ function onEdit(e) {
     var col = range.getColumn();
     var val = range.getValue().toString().trim();
 
-    if (sheetName === dbSheetName) return;
+    if (sheetName === dbSheetName || sheetName === INDEX_SHEET_NAME) return;
 
     // ##############################################################
     // ส่วนที่ 1: ระบบเรียงลำดับ
@@ -87,7 +273,6 @@ function onEdit(e) {
 
             var numRows = lastRealRow - DATA_START_ROW + 1;
 
-            // ใช้ Batch Get Values เพื่อลด overhead
             var billRange = sheet.getRange(DATA_START_ROW, 2, numRows, 1);
             var billValues = billRange.getValues();
             var sortValues = [];
@@ -131,7 +316,7 @@ function onEdit(e) {
     }
 
     // ##############################################################
-    // ส่วนที่ 2: ระบบยิงบาร์โค้ด
+    // ส่วนที่ 2: ระบบยิงบาร์โค้ด (v3 — Index + Binary Search)
     // ##############################################################
     if (row < DATA_START_ROW) return;
 
@@ -163,7 +348,6 @@ function onEdit(e) {
         if (code3Digits === "000") {
             targetSheetName = factorySheetName;
         } else {
-            // [OPTIMIZED] ใช้ cached station mapping
             var stationInfo = findStationNameInBigData(dbSheet, code3Digits, dbColBill, dbColStation);
             if (stationInfo) {
                 targetSheetName = stationInfo;
@@ -203,7 +387,7 @@ function onEdit(e) {
             targetSheet.getRange(nextRow, colBarcode).activate();
             return;
         } else {
-            // [OPTIMIZED v2] เช็คซ้ำก่อน fetch → fail-fast ไม่ต้องเสียเวลาค้นหา DB
+            // เช็คซ้ำก่อน fetch → fail-fast
             if (checkDuplicateOptimized(sheet, val, 2)) {
                 setError(range, statusCell, "ข้อมูลซ้ำ");
                 sheet.getRange(row, 1, 1, 9).clearContent();
@@ -211,10 +395,10 @@ function onEdit(e) {
                 return;
             }
 
-            // [OPTIMIZED v2] ลองดึงจาก cache ก่อน → ถ้าเคยค้นหาแล้วจะเร็วมาก
+            // ===== v3: ลองดึงจาก record cache → Index+BinarySearch → fallback TextFinder =====
             var recordRaw = getCachedRecord(val);
             if (!recordRaw) {
-                recordRaw = findRecordInBigData(dbSheet, val, dbColBill);
+                recordRaw = findRecordByIndex(ss, dbSheet, val);
                 if (recordRaw) setCachedRecord(val, recordRaw);
             }
 
@@ -246,12 +430,10 @@ function extractRunNumber(billString) {
     return numberPart;
 }
 
-// ================= 3. ระบบเช็คข้อมูลอัตโนมัติ (HEAVILY Optimized) =================
+// ================= ระบบเช็คข้อมูลอัตโนมัติ (ใช้ Index) =================
 /**
- * [OPTIMIZED] autoCheckMissingBills — แก้ไข 3 จุดหลัก:
- * 1. ดึงเฉพาะ Col C (bill number) มาสร้าง index → ไม่ต้องโหลด 700K × ทุกคอลัมน์
- * 2. ใช้ chunk-based processing ดึง 50,000 แถว/ครั้ง → ไม่ timeout
- * 3. Batch updates → เขียนหลายแถวพร้อมกันแทน cell-by-cell
+ * autoCheckMissingBills — ใช้ BillIndex เป็น Map แทนโหลดจาก DataBase ตรง
+ * ถ้าไม่มี BillIndex → fallback สร้าง Map จาก DataBase โดยตรง
  */
 function autoCheckMissingBills() {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -260,34 +442,53 @@ function autoCheckMissingBills() {
 
     if (!dbSheet) return;
 
-    var lastDbRow = getCachedLastRow(dbSheet);
-    if (lastDbRow < HEADER_ROWS + 1) return;
-
-    // ================= Phase 1: สร้าง Bill → Row Index (ดึงเฉพาะ Col C) =================
-    var CHUNK_SIZE = 50000;
+    // ลองใช้ BillIndex sheet ก่อน (เร็วกว่า: sorted + 2 columns only)
+    var indexSheet = ss.getSheetByName(INDEX_SHEET_NAME);
     var dbBillToRow = new Map();
 
-    for (var start = HEADER_ROWS + 1; start <= lastDbRow; start += CHUNK_SIZE) {
-        var numRows = Math.min(CHUNK_SIZE, lastDbRow - start + 1);
-        var bills = dbSheet.getRange(start, 3, numRows, 1).getValues(); // Col C only
-        for (var d = 0; d < bills.length; d++) {
-            var bill = bills[d][0];
-            if (bill) {
-                dbBillToRow.set(bill.toString().trim(), start + d);
+    if (indexSheet && indexSheet.getLastRow() > 1) {
+        // ดึงจาก BillIndex (2 columns: bill, rowNumber) → เร็วกว่าดึงจาก DataBase
+        var lastIdxRow = indexSheet.getLastRow();
+        var CHUNK_SIZE = 50000;
+
+        for (var start = 2; start <= lastIdxRow; start += CHUNK_SIZE) {
+            var numRows = Math.min(CHUNK_SIZE, lastIdxRow - start + 1);
+            var idxData = indexSheet.getRange(start, 1, numRows, 2).getValues();
+            for (var d = 0; d < idxData.length; d++) {
+                if (idxData[d][0]) {
+                    dbBillToRow.set(idxData[d][0].toString().trim(), idxData[d][1]);
+                }
+            }
+        }
+    } else {
+        // Fallback: ดึงจาก DataBase โดยตรง (Col C)
+        var lastDbRow = getCachedLastRow(dbSheet);
+        if (lastDbRow < HEADER_ROWS + 1) return;
+
+        var CHUNK_SIZE = 50000;
+        for (var start = HEADER_ROWS + 1; start <= lastDbRow; start += CHUNK_SIZE) {
+            var numRows = Math.min(CHUNK_SIZE, lastDbRow - start + 1);
+            var bills = dbSheet.getRange(start, 3, numRows, 1).getValues();
+            for (var d = 0; d < bills.length; d++) {
+                var bill = bills[d][0];
+                if (bill) {
+                    dbBillToRow.set(bill.toString().trim(), start + d);
+                }
             }
         }
     }
 
-    // ================= Phase 2: ประมวลผลแต่ละชีท =================
-    var colBarcode = 20;  // Col T
-    var colStatus = 21;   // Col U
-    var colMoney = 12;    // Col L
+    // ================= ประมวลผลแต่ละชีท =================
+    var colBarcode = 20;
+    var colStatus = 21;
+    var colMoney = 12;
 
     var allSheets = ss.getSheets();
 
     for (var s = 0; s < allSheets.length; s++) {
         var sheet = allSheets[s];
-        if (sheet.getName() === dbSheetName) continue;
+        var sName = sheet.getName();
+        if (sName === dbSheetName || sName === INDEX_SHEET_NAME) continue;
 
         var lastRow = getLastRowInColumn(sheet, colBarcode);
         if (lastRow < DATA_START_ROW) continue;
@@ -295,9 +496,8 @@ function autoCheckMissingBills() {
         var numDataRows = lastRow - (DATA_START_ROW - 1);
         var barcodeValues = sheet.getRange(DATA_START_ROW, colBarcode, numDataRows, 1).getValues();
 
-        // ================= Phase 2a: รวบรวมแถวที่ต้อง fetch จาก DB =================
-        var rowsToFetch = [];    // { sheetRow, dbRow, billCode }
-        var rowsNotFound = [];   // sheetRow ที่ไม่เจอ
+        var rowsToFetch = [];
+        var rowsNotFound = [];
 
         for (var i = 0; i < barcodeValues.length; i++) {
             var billCode = barcodeValues[i][0].toString().trim();
@@ -313,15 +513,11 @@ function autoCheckMissingBills() {
             }
         }
 
-        // ================= Phase 2b: Batch fetch ข้อมูลจาก DB =================
-        // จัดกลุ่มแถวที่ต้อง fetch เพื่อลด API calls → ดึงเป็น batch ของแถวที่ต่อเนื่องกัน
         if (rowsToFetch.length > 0) {
-            // Sort by dbRow for potential batch optimization
             rowsToFetch.sort(function (a, b) { return a.dbRow - b.dbRow; });
 
-            // Prepare batch data arrays for the target sheet
-            var dataUpdates = [];   // { row, values }
-            var formulaUpdates = []; // { row, formula }
+            var dataUpdates = [];
+            var formulaUpdates = [];
 
             for (var f = 0; f < rowsToFetch.length; f++) {
                 var fetchInfo = rowsToFetch[f];
@@ -335,8 +531,6 @@ function autoCheckMissingBills() {
                 });
             }
 
-            // ================= Phase 2c: Batch write ข้อมูลลงชีท =================
-            // เขียนข้อมูลทีละ batch เพื่อลดจำนวน API calls
             var WRITE_BATCH = 100;
             for (var w = 0; w < dataUpdates.length; w += WRITE_BATCH) {
                 var batchEnd = Math.min(w + WRITE_BATCH, dataUpdates.length);
@@ -349,12 +543,10 @@ function autoCheckMissingBills() {
                     sheet.getRange(update.row, colBarcode).setBackground("#ccffcc");
                 }
 
-                // Flush batch to avoid quota issues
                 SpreadsheetApp.flush();
             }
         }
 
-        // ================= Phase 2d: Mark rows not found =================
         for (var n = 0; n < rowsNotFound.length; n++) {
             var notFoundRow = rowsNotFound[n];
             sheet.getRange(notFoundRow, colStatus).setValue("ไม่พบข้อมูล").setBackground("#ffff99");
@@ -367,7 +559,7 @@ function autoCheckMissingBills() {
     }
 }
 
-// ================= 4. Helper Functions (Optimized with TextFinder + Cache) =================
+// ================= Helper Functions (Search) =================
 
 function mapRecord(dbRecord) {
     return [
@@ -383,15 +575,14 @@ function mapRecord(dbRecord) {
     ];
 }
 
-// [OPTIMIZED v2] ใช้ CacheService + column-range TextFinder (ไม่ต้องรู้ lastRow)
+// ใช้ CacheService + column-range TextFinder หา station name
 function findStationNameInBigData(dbSheet, code3Digits, colBillIndex, colStationIndex) {
     var cache = CacheService.getScriptCache();
     var cacheKey = 'station_' + code3Digits;
     var cached = cache.get(cacheKey);
     if (cached) return cached;
 
-    // [OPTIMIZED v2] ใช้ column range "C:C" → ข้าม getCachedLastRow() ไปเลย
-    var colLetter = String.fromCharCode(64 + colBillIndex); // 3 → 'C'
+    var colLetter = String.fromCharCode(64 + colBillIndex);
     var searchRange = dbSheet.getRange(colLetter + ':' + colLetter);
 
     var regexPattern = ".*" + code3Digits + "\\/.*";
@@ -412,16 +603,14 @@ function findStationNameInBigData(dbSheet, code3Digits, colBillIndex, colStation
     return null;
 }
 
-// [OPTIMIZED v2] ใช้ column-range TextFinder + record caching
+// Fallback: TextFinder ค้นหาตรงใน DataBase (ใช้เมื่อไม่มี BillIndex)
 function findRecordInBigData(dbSheet, searchVal, colIndex) {
-    // [OPTIMIZED v2] ใช้ column range → ข้าม getCachedLastRow() ทั้งหมด
-    var colLetter = String.fromCharCode(64 + colIndex); // 3 → 'C'
+    var colLetter = String.fromCharCode(64 + colIndex);
     var searchRange = dbSheet.getRange(colLetter + ':' + colLetter);
 
     var finder = searchRange.createTextFinder(searchVal.toString().trim()).matchEntireCell(true);
     var foundCell = finder.findNext();
 
-    // ข้าม header rows
     if (foundCell && foundCell.getRow() > HEADER_ROWS) {
         return dbSheet.getRange(foundCell.getRow(), 1, 1, DB_MAX_COLS).getValues()[0];
     }
@@ -429,24 +618,22 @@ function findRecordInBigData(dbSheet, searchVal, colIndex) {
     return null;
 }
 
-// [OPTIMIZED v2] เช็คซ้ำด้วย column-range TextFinder (ข้าม getLastRowInColumn)
+// เช็คซ้ำด้วย column-range TextFinder
 function checkDuplicateOptimized(sheet, val, colIndex) {
-    var colLetter = String.fromCharCode(64 + colIndex); // 2 → 'B'
+    var colLetter = String.fromCharCode(64 + colIndex);
     var searchRange = sheet.getRange(colLetter + ':' + colLetter);
 
     var finder = searchRange.createTextFinder(val.toString().trim()).matchEntireCell(true);
     var foundCell = finder.findNext();
 
-    // เจอแถวที่ > HEADER_ROWS ถือว่าซ้ำ
     return (foundCell && foundCell.getRow() > HEADER_ROWS);
 }
 
-// [OPTIMIZED] อ่านแค่ 500 แถวล่าสุดแทนอ่านทั้งคอลัมน์
+// อ่านแค่ 500 แถวล่าสุดเพื่อหา last row ที่มีข้อมูล
 function getLastRowInColumn(sheet, column) {
     var lastRow = sheet.getLastRow();
     if (lastRow < 1) return 0;
 
-    // Optimized: อ่านแค่ batch ล่าสุด (500 แถว) ก่อน
     var batchSize = 500;
     var startRow = Math.max(1, lastRow - batchSize + 1);
     var numRows = lastRow - startRow + 1;
@@ -458,7 +645,6 @@ function getLastRowInColumn(sheet, column) {
         }
     }
 
-    // Fallback: ถ้า 500 แถวล่าสุดว่างหมด → scan จากต้น
     if (startRow > 1) {
         data = sheet.getRange(1, column, startRow - 1, 1).getValues();
         for (var i = data.length - 1; i >= 0; i--) {
