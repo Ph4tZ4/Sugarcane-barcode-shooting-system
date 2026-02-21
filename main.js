@@ -430,133 +430,375 @@ function extractRunNumber(billString) {
     return numberPart;
 }
 
-// ================= ระบบเช็คข้อมูลอัตโนมัติ (ใช้ Index) =================
+// ================= ระบบเช็คข้อมูลอัตโนมัติ — Optimized v3 (Two-Pass Global Fetch) =================
 /**
- * autoCheckMissingBills — ใช้ BillIndex เป็น Map แทนโหลดจาก DataBase ตรง
- * ถ้าไม่มี BillIndex → fallback สร้าง Map จาก DataBase โดยตรง
+ * autoCheckMissingBills — Optimized v3
+ * 
+ * สถาปัตยกรรม 3 เฟส:
+ *   Phase 1: สแกนทุก sheet → รวบรวม DB rows ที่ต้องการทั้งหมด
+ *   Phase 2: Global batch fetch จาก DataBase ครั้งเดียว (deduplicate ข้าม sheets)
+ *   Phase 3: เขียนข้อมูลลงแต่ละ sheet จาก memory
+ *
+ * ข้อดี: ดึง DB แค่ครั้งเดียวสำหรับทุก sheet, ลด API calls อย่างมาก
  */
 function autoCheckMissingBills() {
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var dbSheetName = "DataBase";
-    var dbSheet = ss.getSheetByName(dbSheetName);
+    var startTime = new Date().getTime();
+    var MAX_RUNTIME_MS = 5 * 60 * 1000; // 5 นาที
 
-    if (!dbSheet) return;
+    try {
+        var ss = SpreadsheetApp.getActiveSpreadsheet();
+        var dbSheetName = "DataBase";
+        var dbSheet = ss.getSheetByName(dbSheetName);
 
-    // ลองใช้ BillIndex sheet ก่อน (เร็วกว่า: sorted + 2 columns only)
-    var indexSheet = ss.getSheetByName(INDEX_SHEET_NAME);
-    var dbBillToRow = new Map();
+        if (!dbSheet) {
+            Logger.log("❌ ไม่พบชีท DataBase");
+            return;
+        }
 
-    if (indexSheet && indexSheet.getLastRow() > 1) {
-        // ดึงจาก BillIndex (2 columns: bill, rowNumber) → เร็วกว่าดึงจาก DataBase
-        var lastIdxRow = indexSheet.getLastRow();
-        var CHUNK_SIZE = 50000;
+        // ========== สร้าง Bill → DB Row Map ==========
+        var indexSheet = ss.getSheetByName(INDEX_SHEET_NAME);
+        var dbBillToRow = {};
 
-        for (var start = 2; start <= lastIdxRow; start += CHUNK_SIZE) {
-            var numRows = Math.min(CHUNK_SIZE, lastIdxRow - start + 1);
-            var idxData = indexSheet.getRange(start, 1, numRows, 2).getValues();
-            for (var d = 0; d < idxData.length; d++) {
-                if (idxData[d][0]) {
-                    dbBillToRow.set(idxData[d][0].toString().trim(), idxData[d][1]);
+        if (indexSheet && indexSheet.getLastRow() > 1) {
+            var lastIdxRow = indexSheet.getLastRow();
+            var CHUNK_SIZE = 50000;
+            for (var start = 2; start <= lastIdxRow; start += CHUNK_SIZE) {
+                var numRows = Math.min(CHUNK_SIZE, lastIdxRow - start + 1);
+                var idxData = indexSheet.getRange(start, 1, numRows, 2).getValues();
+                for (var d = 0; d < idxData.length; d++) {
+                    if (idxData[d][0]) {
+                        dbBillToRow[idxData[d][0].toString().trim()] = idxData[d][1];
+                    }
                 }
             }
-        }
-    } else {
-        // Fallback: ดึงจาก DataBase โดยตรง (Col C)
-        var lastDbRow = getCachedLastRow(dbSheet);
-        if (lastDbRow < HEADER_ROWS + 1) return;
-
-        var CHUNK_SIZE = 50000;
-        for (var start = HEADER_ROWS + 1; start <= lastDbRow; start += CHUNK_SIZE) {
-            var numRows = Math.min(CHUNK_SIZE, lastDbRow - start + 1);
-            var bills = dbSheet.getRange(start, 3, numRows, 1).getValues();
-            for (var d = 0; d < bills.length; d++) {
-                var bill = bills[d][0];
-                if (bill) {
-                    dbBillToRow.set(bill.toString().trim(), start + d);
-                }
-            }
-        }
-    }
-
-    // ================= ประมวลผลแต่ละชีท =================
-    var colBarcode = 20;
-    var colStatus = 21;
-    var colMoney = 12;
-
-    var allSheets = ss.getSheets();
-
-    for (var s = 0; s < allSheets.length; s++) {
-        var sheet = allSheets[s];
-        var sName = sheet.getName();
-        if (sName === dbSheetName || sName === INDEX_SHEET_NAME) continue;
-
-        var lastRow = getLastRowInColumn(sheet, colBarcode);
-        if (lastRow < DATA_START_ROW) continue;
-
-        var numDataRows = lastRow - (DATA_START_ROW - 1);
-        var barcodeValues = sheet.getRange(DATA_START_ROW, colBarcode, numDataRows, 1).getValues();
-
-        var rowsToFetch = [];
-        var rowsNotFound = [];
-
-        for (var i = 0; i < barcodeValues.length; i++) {
-            var billCode = barcodeValues[i][0].toString().trim();
-            var currentRow = i + DATA_START_ROW;
-
-            if (billCode !== "") {
-                var dbRow = dbBillToRow.get(billCode);
-                if (dbRow !== undefined) {
-                    rowsToFetch.push({ sheetRow: currentRow, dbRow: dbRow });
-                } else {
-                    rowsNotFound.push(currentRow);
+        } else {
+            var lastDbRow = getCachedLastRow(dbSheet);
+            if (lastDbRow < HEADER_ROWS + 1) return;
+            var CHUNK_SIZE = 50000;
+            for (var start = HEADER_ROWS + 1; start <= lastDbRow; start += CHUNK_SIZE) {
+                var numRows = Math.min(CHUNK_SIZE, lastDbRow - start + 1);
+                var bills = dbSheet.getRange(start, 3, numRows, 1).getValues();
+                for (var d = 0; d < bills.length; d++) {
+                    if (bills[d][0]) {
+                        dbBillToRow[bills[d][0].toString().trim()] = start + d;
+                    }
                 }
             }
         }
 
-        if (rowsToFetch.length > 0) {
-            rowsToFetch.sort(function (a, b) { return a.dbRow - b.dbRow; });
+        Logger.log("✅ Phase 0: Bill Map — " + Object.keys(dbBillToRow).length + " entries — " +
+            ((new Date().getTime() - startTime) / 1000).toFixed(1) + "s");
 
-            var dataUpdates = [];
-            var formulaUpdates = [];
+        // ================================================================
+        // Phase 1: สแกนทุก sheet → รวบรวม DB rows ที่ต้องการ
+        // ================================================================
+        var colBarcode = 20;
+        var colStatus = 21;
+        var colMoney = 12;
 
-            for (var f = 0; f < rowsToFetch.length; f++) {
-                var fetchInfo = rowsToFetch[f];
-                var recordRaw = dbSheet.getRange(fetchInfo.dbRow, 1, 1, DB_MAX_COLS).getValues()[0];
-                var mappedData = mapRecord(recordRaw);
+        var allSheets = ss.getSheets();
+        var sheetTasks = []; // เก็บงานที่ต้องทำสำหรับแต่ละ sheet
+        var allNeededDbRows = {}; // {dbRow: true} — deduplicate ข้าม sheets
 
-                dataUpdates.push({ row: fetchInfo.sheetRow, values: mappedData });
-                formulaUpdates.push({
-                    row: fetchInfo.sheetRow,
-                    formula: "=E" + fetchInfo.sheetRow + "*J" + fetchInfo.sheetRow + "-H" + fetchInfo.sheetRow + "+K" + fetchInfo.sheetRow
+        for (var s = 0; s < allSheets.length; s++) {
+            var sheet = allSheets[s];
+            var sName = sheet.getName();
+            if (sName === dbSheetName || sName === INDEX_SHEET_NAME) continue;
+
+            var lastRow = getLastRowInColumn(sheet, colBarcode);
+            if (lastRow < DATA_START_ROW) continue;
+
+            var numDataRows = lastRow - (DATA_START_ROW - 1);
+            var barcodeValues = sheet.getRange(DATA_START_ROW, colBarcode, numDataRows, 1).getValues();
+
+            var rowsToFetch = [];
+            var rowsNotFound = [];
+
+            for (var i = 0; i < barcodeValues.length; i++) {
+                var billCode = barcodeValues[i][0].toString().trim();
+                var currentRow = i + DATA_START_ROW;
+
+                if (billCode !== "") {
+                    var dbRow = dbBillToRow[billCode];
+                    if (dbRow !== undefined) {
+                        rowsToFetch.push({ sheetRow: currentRow, dbRow: dbRow });
+                        allNeededDbRows[dbRow] = true; // เก็บ unique DB rows
+                    } else {
+                        rowsNotFound.push(currentRow);
+                    }
+                }
+            }
+
+            if (rowsToFetch.length > 0 || rowsNotFound.length > 0) {
+                sheetTasks.push({
+                    sheet: sheet,
+                    sheetName: sName,
+                    rowsToFetch: rowsToFetch,
+                    rowsNotFound: rowsNotFound
                 });
             }
+        }
 
-            var WRITE_BATCH = 100;
-            for (var w = 0; w < dataUpdates.length; w += WRITE_BATCH) {
-                var batchEnd = Math.min(w + WRITE_BATCH, dataUpdates.length);
+        var uniqueDbRows = Object.keys(allNeededDbRows).map(Number);
+        Logger.log("✅ Phase 1: สแกน " + sheetTasks.length + " sheets — ต้องดึง " +
+            uniqueDbRows.length + " unique DB rows — " +
+            ((new Date().getTime() - startTime) / 1000).toFixed(1) + "s");
 
-                for (var b = w; b < batchEnd; b++) {
-                    var update = dataUpdates[b];
-                    sheet.getRange(update.row, 1, 1, update.values.length).setValues([update.values]);
-                    sheet.getRange(update.row, colMoney).setFormula(formulaUpdates[b].formula);
-                    sheet.getRange(update.row, colStatus).setValue("OK").setBackground("#ccffcc");
-                    sheet.getRange(update.row, colBarcode).setBackground("#ccffcc");
+        // ================================================================
+        // Phase 2: Global batch fetch จาก DataBase ครั้งเดียว
+        // ================================================================
+        var dbRowToRecord = {}; // {dbRow: mappedRecord}
+
+        if (uniqueDbRows.length > 0) {
+            // Sort DB rows → group consecutive → batch fetch
+            uniqueDbRows.sort(function (a, b) { return a - b; });
+
+            var fetchItems = [];
+            for (var u = 0; u < uniqueDbRows.length; u++) {
+                fetchItems.push({ sheetRow: 0, dbRow: uniqueDbRows[u] }); // sheetRow ไม่ใช้ในตอน fetch
+            }
+
+            var groups = groupConsecutiveDbRows(fetchItems);
+
+            for (var g = 0; g < groups.length; g++) {
+                // ⏰ Time guard ระหว่าง fetch
+                if (new Date().getTime() - startTime > MAX_RUNTIME_MS) {
+                    Logger.log("⏰ Time limit ระหว่าง global fetch (group " + (g + 1) + "/" + groups.length + ")");
+                    break;
                 }
 
-                SpreadsheetApp.flush();
+                var group = groups[g];
+                var batchData = dbSheet.getRange(group.startDbRow, 1, group.count, DB_MAX_COLS).getValues();
+
+                for (var r = 0; r < group.items.length; r++) {
+                    var item = group.items[r];
+                    var rowInBatch = item.dbRow - group.startDbRow;
+                    dbRowToRecord[item.dbRow] = mapRecord(batchData[rowInBatch]);
+                }
             }
         }
 
-        for (var n = 0; n < rowsNotFound.length; n++) {
-            var notFoundRow = rowsNotFound[n];
-            sheet.getRange(notFoundRow, colStatus).setValue("ไม่พบข้อมูล").setBackground("#ffff99");
-            sheet.getRange(notFoundRow, colBarcode).setBackground("#ffff99");
+        Logger.log("✅ Phase 2: Global fetch เสร็จ — " + Object.keys(dbRowToRecord).length +
+            " records — " + ((new Date().getTime() - startTime) / 1000).toFixed(1) + "s");
+
+        // ================================================================
+        // Phase 3: เขียนข้อมูลลงแต่ละ sheet จาก memory (ไม่ต้องดึง DB อีก)
+        // ================================================================
+        var sheetsProcessed = 0;
+
+        for (var t = 0; t < sheetTasks.length; t++) {
+            // ⏰ Time guard
+            if (new Date().getTime() - startTime > MAX_RUNTIME_MS) {
+                Logger.log("⏰ ใกล้ถึง time limit — เขียนได้ " + sheetsProcessed + "/" + sheetTasks.length + " sheets");
+                break;
+            }
+
+            var task = sheetTasks[t];
+            var sheet = task.sheet;
+
+            // ===== เขียน Found rows =====
+            if (task.rowsToFetch.length > 0) {
+                var dataUpdates = [];
+
+                for (var f = 0; f < task.rowsToFetch.length; f++) {
+                    var fetchInfo = task.rowsToFetch[f];
+                    var record = dbRowToRecord[fetchInfo.dbRow];
+                    if (record) {
+                        dataUpdates.push({
+                            row: fetchInfo.sheetRow,
+                            values: record,
+                            formula: "=E" + fetchInfo.sheetRow + "*J" + fetchInfo.sheetRow + "-H" + fetchInfo.sheetRow + "+K" + fetchInfo.sheetRow
+                        });
+                    }
+                }
+
+                if (dataUpdates.length > 0) {
+                    var successStatusRanges = [];
+                    var successBarcodeRanges = [];
+
+                    var writeGroups = groupContiguousSheetRows(dataUpdates);
+
+                    for (var wg = 0; wg < writeGroups.length; wg++) {
+                        var wGroup = writeGroups[wg];
+                        var wStartRow = wGroup.startRow;
+                        var wNumRows = wGroup.items.length;
+
+                        var valuesArray = [];
+                        var formulaArray = [];
+                        var statusArray = [];
+
+                        for (var wi = 0; wi < wGroup.items.length; wi++) {
+                            var wItem = wGroup.items[wi];
+                            valuesArray.push(wItem.values);
+                            formulaArray.push([wItem.formula]);
+                            statusArray.push(["OK"]);
+
+                            successStatusRanges.push("U" + wItem.row);
+                            successBarcodeRanges.push("T" + wItem.row);
+                        }
+
+                        sheet.getRange(wStartRow, 1, wNumRows, valuesArray[0].length).setValues(valuesArray);
+                        sheet.getRange(wStartRow, colMoney, wNumRows, 1).setFormulas(formulaArray);
+                        sheet.getRange(wStartRow, colStatus, wNumRows, 1).setValues(statusArray);
+                    }
+
+                    if (successStatusRanges.length > 0) {
+                        sheet.getRangeList(successStatusRanges).setBackground("#ccffcc");
+                        sheet.getRangeList(successBarcodeRanges).setBackground("#ccffcc");
+                    }
+                }
+            }
+
+            // ===== เขียน Not Found rows =====
+            if (task.rowsNotFound.length > 0) {
+                var notFoundStatusRanges = [];
+                var notFoundBarcodeRanges = [];
+
+                var nfGroups = groupContiguousNotFoundRows(task.rowsNotFound);
+
+                for (var nfg = 0; nfg < nfGroups.length; nfg++) {
+                    var nfGroup = nfGroups[nfg];
+                    var nfStatusArray = [];
+                    for (var nfi = 0; nfi < nfGroup.count; nfi++) {
+                        nfStatusArray.push(["ไม่พบข้อมูล"]);
+                        notFoundStatusRanges.push("U" + (nfGroup.startRow + nfi));
+                        notFoundBarcodeRanges.push("T" + (nfGroup.startRow + nfi));
+                    }
+                    sheet.getRange(nfGroup.startRow, colStatus, nfGroup.count, 1).setValues(nfStatusArray);
+                }
+
+                if (notFoundStatusRanges.length > 0) {
+                    sheet.getRangeList(notFoundStatusRanges).setBackground("#ffff99");
+                    sheet.getRangeList(notFoundBarcodeRanges).setBackground("#ffff99");
+                }
+            }
+
+            SpreadsheetApp.flush();
+            sheetsProcessed++;
         }
 
-        if (rowsNotFound.length > 0) {
-            SpreadsheetApp.flush();
+        var elapsed = ((new Date().getTime() - startTime) / 1000).toFixed(1);
+        Logger.log("✅ autoCheckMissingBills เสร็จ — " + sheetsProcessed + "/" + sheetTasks.length +
+            " sheets — " + elapsed + "s");
+
+    } catch (error) {
+        var elapsed = ((new Date().getTime() - startTime) / 1000).toFixed(1);
+        Logger.log("❌ autoCheckMissingBills error หลังจาก " + elapsed + "s: " + error.message);
+        Logger.log("Stack: " + error.stack);
+    }
+}
+
+/**
+ * จัดกลุ่ม rowsToFetch ที่มี dbRow ต่อเนื่องกัน (หรือใกล้กัน) เป็น batch
+ * เพื่อ fetch ด้วย getRange() เดียวแทน fetch ทีละแถว
+ * 
+ * GAP_THRESHOLD = 50: ถ้า rows ห่างกันไม่เกิน 50 แถว ก็รวมเป็น batch เดียว
+ * (ดีกว่า fetch แยก เพราะ 1 API call ดึง 50 แถว เร็วกว่า 2 API calls ดึงแถวเดียว)
+ */
+function groupConsecutiveDbRows(sortedRowsToFetch) {
+    if (sortedRowsToFetch.length === 0) return [];
+
+    var GAP_THRESHOLD = 50; // รวม group ถ้า gap ≤ 50 rows
+    var MAX_BATCH_SIZE = 5000; // จำกัดขนาด batch สูงสุด
+
+    var groups = [];
+    var currentGroup = {
+        startDbRow: sortedRowsToFetch[0].dbRow,
+        endDbRow: sortedRowsToFetch[0].dbRow,
+        items: [sortedRowsToFetch[0]]
+    };
+
+    for (var i = 1; i < sortedRowsToFetch.length; i++) {
+        var item = sortedRowsToFetch[i];
+        var gap = item.dbRow - currentGroup.endDbRow;
+        var batchSize = item.dbRow - currentGroup.startDbRow + 1;
+
+        if (gap <= GAP_THRESHOLD && batchSize <= MAX_BATCH_SIZE) {
+            // ต่อเนื่อง → รวมใน group เดิม
+            currentGroup.endDbRow = item.dbRow;
+            currentGroup.items.push(item);
+        } else {
+            // Gap ใหญ่เกินไป → ปิด group เก่า เปิด group ใหม่
+            currentGroup.count = currentGroup.endDbRow - currentGroup.startDbRow + 1;
+            groups.push(currentGroup);
+            currentGroup = {
+                startDbRow: item.dbRow,
+                endDbRow: item.dbRow,
+                items: [item]
+            };
         }
     }
+
+    // ปิด group สุดท้าย
+    currentGroup.count = currentGroup.endDbRow - currentGroup.startDbRow + 1;
+    groups.push(currentGroup);
+
+    return groups;
+}
+
+/**
+ * จัดกลุ่ม dataUpdates ตาม sheet row ที่ต่อเนื่องกัน
+ * เพื่อ batch write ด้วย setValues/setFormulas เดียว
+ * ลด API calls จาก 3N → 3G (G = จำนวน groups)
+ */
+function groupContiguousSheetRows(dataUpdates) {
+    if (dataUpdates.length === 0) return [];
+
+    // Sort ตาม sheet row
+    dataUpdates.sort(function (a, b) { return a.row - b.row; });
+
+    var groups = [];
+    var currentGroup = {
+        startRow: dataUpdates[0].row,
+        items: [dataUpdates[0]]
+    };
+
+    for (var i = 1; i < dataUpdates.length; i++) {
+        var item = dataUpdates[i];
+        var lastRow = currentGroup.items[currentGroup.items.length - 1].row;
+
+        if (item.row === lastRow + 1) {
+            // ต่อเนื่อง → รวม group
+            currentGroup.items.push(item);
+        } else {
+            // ไม่ต่อเนื่อง → ปิด group เก่า เปิด group ใหม่
+            groups.push(currentGroup);
+            currentGroup = {
+                startRow: item.row,
+                items: [item]
+            };
+        }
+    }
+    groups.push(currentGroup);
+
+    return groups;
+}
+
+/**
+ * จัดกลุ่ม not-found row numbers ที่ต่อเนื่องกัน
+ * เพื่อ batch write "ไม่พบข้อมูล" ด้วย setValues เดียว
+ */
+function groupContiguousNotFoundRows(rowNumbers) {
+    if (rowNumbers.length === 0) return [];
+
+    rowNumbers.sort(function (a, b) { return a - b; });
+
+    var groups = [];
+    var currentStart = rowNumbers[0];
+    var currentCount = 1;
+
+    for (var i = 1; i < rowNumbers.length; i++) {
+        if (rowNumbers[i] === rowNumbers[i - 1] + 1) {
+            currentCount++;
+        } else {
+            groups.push({ startRow: currentStart, count: currentCount });
+            currentStart = rowNumbers[i];
+            currentCount = 1;
+        }
+    }
+    groups.push({ startRow: currentStart, count: currentCount });
+
+    return groups;
 }
 
 // ================= Helper Functions (Search) =================
